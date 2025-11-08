@@ -13,6 +13,14 @@ pipeline {
     // Public repo (no creds). If private, add Jenkins creds and switch logic below.
     GIT_URL    = 'https://github.com/raizen707/django-rest-swarm'
     GIT_BRANCH = 'master'   // change to 'main' if your repo uses main
+
+    // ---- Kubernetes (optional) ----
+    USE_K8S              = 'true'        // set to 'true' to enable K8s stages
+    K8S_NAMESPACE        = 'default'
+    K8S_APP_NAME         = 'django-rest-api'
+    K8S_DEPLOY_REPLICAS  = '2'
+    // Jenkins "Secret file" credential containing your kubeconfig:
+    K8S_KUBECONFIG_CRED  = 'kubeconfig_file'
   }
 
   stages {
@@ -83,7 +91,7 @@ pipeline {
             CID=\$(docker run -d -p 18000:8000 ${LATEST})
             echo "Temp container: \$CID"
             for i in \$(seq 1 20); do
-              if curl -sf http://host.docker.internal:18000/health >/dev/null; then
+              if curl -sf http://host.docker.internal:18000/health >/div/null; then
                 echo "Smoke test passed"; break
               fi
               sleep 1
@@ -138,77 +146,90 @@ networks:
         }
       }
       steps {
-        sh '''
+        sh """
           set -e
           if ! docker network ls --format '{{.Name}}' | grep -q '^webnet$'; then
             docker network create -d overlay webnet
           fi
           docker stack deploy -c docker-stack.yml ${STACK}
           docker stack services ${STACK}
-        '''
+        """
       }
     }
 
-    stage('Deploy to Kubernetes') {
-      agent {
-        docker {
-          image 'bitnami/kubectl:latest'
-          args  '-v ${HOME}/.kube:/root/.kube'
-          reuseNode true
-        }
-      }
+    // -------------------- KUBERNETES ADD-ON --------------------
+    stage('Prepare K8s Manifests') {
+      when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
       steps {
-        sh """
-          cat <<EOF | kubectl apply -f -
+        writeFile file: 'k8s-deploy.yaml', text: """
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ${APP_NAME}
+  name: ${K8S_APP_NAME}
+  namespace: ${K8S_NAMESPACE}
   labels:
-    app: ${APP_NAME}
+    app: ${K8S_APP_NAME}
 spec:
-  replicas: ${REPLICAS}
+  replicas: ${K8S_DEPLOY_REPLICAS}
   selector:
     matchLabels:
-      app: ${APP_NAME}
+      app: ${K8S_APP_NAME}
   template:
     metadata:
       labels:
-        app: ${APP_NAME}
+        app: ${K8S_APP_NAME}
     spec:
       containers:
-      - name: ${APP_NAME}
+      - name: api
         image: ${LATEST}
-        ports:
-        - containerPort: 8000
+        imagePullPolicy: IfNotPresent
         env:
         - name: DJANGO_SECRET_KEY
           value: "prod-secret"
+        ports:
+        - containerPort: 8000
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${APP_NAME}
+  name: ${K8S_APP_NAME}
+  namespace: ${K8S_NAMESPACE}
 spec:
-  type: NodePort
   selector:
-    app: ${APP_NAME}
+    app: ${K8S_APP_NAME}
   ports:
-  - port: 8000
-    targetPort: 8000
-    nodePort: 30800
-EOF
-          kubectl rollout status deployment/${APP_NAME}
-          kubectl get pods -l app=${APP_NAME}
-        """
+  - name: http
+    port: 80
+    targetPort: 31080
+  type: ClusterIP
+"""
       }
     }
+
+    stage('Deploy to Kubernetes') {
+      when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
+      agent { docker { image 'bitnami/kubectl:1.30' } }
+      steps {
+        withCredentials([file(credentialsId: "${K8S_KUBECONFIG_CRED}", variable: 'KUBECONFIG_FILE')]) {
+          sh """
+            set -e
+            kubectl --kubeconfig "$KUBECONFIG_FILE" get ns ${K8S_NAMESPACE} >/dev/null 2>&1 || \
+              kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace ${K8S_NAMESPACE}
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} apply -f k8s-deploy.yaml
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=120s
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc,deploy,pods -l app=${K8S_APP_NAME}
+          """
+        }
+      }
+    }
+    // ------------------ END KUBERNETES ADD-ON ------------------
   }
 
   post {
     success {
-      echo "Deployed ${LATEST} to stack ${STACK} with ${REPLICAS} replicas."
-      echo "Test: http://localhost:8000/health  http://localhost:8000/hello"
+      echo "Swarm: deployed ${LATEST} to stack ${STACK} with ${REPLICAS} replicas."
+      echo "K8s: set USE_K8S='true' to enable Kubernetes deployment with your kubeconfig credential (${K8S_KUBECONFIG_CRED})."
+      echo "Test: http://localhost:8000/health  http://localhost:8000/hello  or port 31080 if using K8s."
     }
     failure {
       echo "Pipeline failed. Check the stage logs for details."
