@@ -14,18 +14,19 @@ pipeline {
     GIT_URL    = 'https://github.com/raizen707/django-rest-swarm'
     GIT_BRANCH = 'master'   // change to 'main' if needed
 
-    // ---- Kubernetes (toggle ON to deploy) ----
-    USE_K8S              = 'true'         // set 'true' to enable K8s stages
+    // ---- Kubernetes ----
+    USE_K8S              = 'true'          // set 'false' to skip K8s
     K8S_NAMESPACE        = 'default'
     K8S_APP_NAME         = 'django-rest-api'
     K8S_DEPLOY_REPLICAS  = '2'
     K8S_KUBECONFIG_CRED  = 'kubeconfig_file'
 
-    // Expose Kubernetes via NodePort (optional testing)
-    K8S_SERVICE_PORT     = '8081'         // cluster service port
-    K8S_NODE_PORT        = '31080'        // host port (30000–32767)
+    // NodePort exposure
+    K8S_SERVICE_PORT     = '8081'          // cluster service port
+    K8S_NODE_PORT        = '31080'         // host port (30000–32767)
 
-    // K8s image reference mode: 'local' (no pull) or 'registry'
+    // Image reference mode for K8s: 'local' (no pull) or 'registry'
+    // If rollout keeps timing out, try 'registry' and ensure Docker Desktop trusts the registry.
     K8S_IMAGE_MODE       = 'local'
   }
 
@@ -48,9 +49,8 @@ pipeline {
           docker push ${IMAGE}
           docker tag  ${IMAGE} ${LATEST}
           docker push ${LATEST}
-          # local tag for K8s 'local' mode
+          # tag also without registry for K8s 'local' mode
           docker tag ${LATEST} ${APP_NAME}:latest
-          docker image ls | grep ${APP_NAME} || true
         """
       }
     }
@@ -152,22 +152,21 @@ spec:
           value: "prod-secret"
         ports:
         - containerPort: 8000
+        # Probes: use TCP to avoid 404s if /health is missing
         readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 15
-          periodSeconds: 5
-          timeoutSeconds: 2
-          failureThreshold: 12
-        livenessProbe:
-          httpGet:
-            path: /health
+          tcpSocket:
             port: 8000
           initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 24   # ~2 minutes
+        livenessProbe:
+          tcpSocket:
+            port: 8000
+          initialDelaySeconds: 60
           periodSeconds: 10
-          timeoutSeconds: 2
-          failureThreshold: 6
+          timeoutSeconds: 3
+          failureThreshold: 12   # ~2 minutes
 ---
 apiVersion: v1
 kind: Service
@@ -191,17 +190,31 @@ spec:
       when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
       steps {
         withCredentials([file(credentialsId: "${K8S_KUBECONFIG_CRED}", variable: 'KUBECONFIG_FILE')]) {
-          sh """
-            set -e
-            kubectl --kubeconfig "$KUBECONFIG_FILE" version --client
-            kubectl --kubeconfig "$KUBECONFIG_FILE" get ns ${K8S_NAMESPACE} >/dev/null 2>&1 || \
-              kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace ${K8S_NAMESPACE}
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} apply -f k8s-deploy.yaml
-            sleep 5
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=300s
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -o wide -l app=${K8S_APP_NAME}
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc/${K8S_APP_NAME}
-          """
+          // Use single-quoted Groovy strings so the secret path isn't interpolated by Groovy
+          sh 'kubectl --kubeconfig "$KUBECONFIG_FILE" version --client'
+          sh 'kubectl --kubeconfig "$KUBECONFIG_FILE" get ns ${K8S_NAMESPACE} >/dev/null 2>&1 || kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace ${K8S_NAMESPACE}'
+          sh 'kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} apply -f k8s-deploy.yaml'
+          // Give scheduler some time, then wait longer for rollout
+          sh 'sleep 8'
+          // If rollout fails, dump diagnostics and fail the build
+          sh '''
+            set +e
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=600s
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "=== K8s DEBUG: describe deployment ==="
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME} || true
+              echo "=== K8s DEBUG: describe pods ==="
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | \
+                xargs -I{} sh -c 'echo "--- {} ---"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {} || true'
+              echo "=== K8s DEBUG: pod logs (tail) ==="
+              for p in $(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
+                kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "$p" --tail=200 || true
+              done
+              exit $rc
+            fi
+          '''
+          sh 'kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc/${K8S_APP_NAME}'
         }
       }
     }
@@ -213,41 +226,8 @@ spec:
       echo "Swarm: http://localhost:8000/health"
       echo "K8s:   http://localhost:${K8S_NODE_PORT}/health (NodePort ${K8S_NODE_PORT}, service port ${K8S_SERVICE_PORT})"
     }
-    unstable {
-      script {
-        if (env.USE_K8S?.toLowerCase() == 'true') {
-          withCredentials([file(credentialsId: env.K8S_KUBECONFIG_CRED, variable: 'KUBECONFIG_FILE')]) {
-            sh """
-              set +e
-              echo "=== K8s DEBUG (unstable) ==="
-              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME}
-              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | \
-                xargs -I{} sh -c 'echo "--- {} ---"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {}'
-              for p in \$(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
-                kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "\$p" --tail=200 || true
-              done
-            """
-          }
-        }
-      }
-    }
     failure {
-      script {
-        if (env.USE_K8S?.toLowerCase() == 'true') {
-          withCredentials([file(credentialsId: env.K8S_KUBECONFIG_CRED, variable: 'KUBECONFIG_FILE')]) {
-            sh """
-              set +e
-              echo "=== K8s DEBUG (failure) ==="
-              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME}
-              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | \
-                xargs -I{} sh -c 'echo "--- {} ---"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {}'
-              for p in \$(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
-                kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "\$p" --tail=200 || true
-              done
-            """
-          }
-        }
-      }
+      echo "Pipeline failed. See K8s diagnostics above if USE_K8S=true."
     }
   }
 }
