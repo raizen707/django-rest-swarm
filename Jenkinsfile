@@ -21,6 +21,10 @@ pipeline {
     K8S_DEPLOY_REPLICAS  = '2'
     // Jenkins "Secret file" credential containing your kubeconfig:
     K8S_KUBECONFIG_CRED  = 'kubeconfig_file'
+
+    // Expose Kubernetes on another host port via NodePort
+    K8S_SERVICE_PORT     = '8081'   // cluster Service port
+    K8S_NODE_PORT        = '31080'  // external host port (30000–32767)
   }
 
   stages {
@@ -91,7 +95,7 @@ pipeline {
             CID=\$(docker run -d -p 18000:8000 ${LATEST})
             echo "Temp container: \$CID"
             for i in \$(seq 1 20); do
-              if curl -sf http://host.docker.internal:18000/health >/div/null; then
+              if curl -sf http://host.docker.internal:18000/health >/dev/null; then
                 echo "Smoke test passed"; break
               fi
               sleep 1
@@ -188,6 +192,14 @@ spec:
           value: "prod-secret"
         ports:
         - containerPort: 8000
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          initialDelaySeconds: 10
+          periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -197,11 +209,12 @@ metadata:
 spec:
   selector:
     app: ${K8S_APP_NAME}
+  type: NodePort
   ports:
   - name: http
-    port: 80
-    targetPort: 31080
-  type: ClusterIP
+    port: ${K8S_SERVICE_PORT}   # cluster service port (e.g., 8081)
+    targetPort: 8000            # container port
+    nodePort: ${K8S_NODE_PORT}  # host port (e.g., 31080)
 """
       }
     }
@@ -228,8 +241,8 @@ spec:
   post {
     success {
       echo "Swarm: deployed ${LATEST} to stack ${STACK} with ${REPLICAS} replicas."
-      echo "K8s: set USE_K8S='true' to enable Kubernetes deployment with your kubeconfig credential (${K8S_KUBECONFIG_CRED})."
-      echo "Test: http://localhost:8000/health  http://localhost:8000/hello  or port 31080 if using K8s."
+      echo "K8s NodePort: http://localhost:${K8S_NODE_PORT}/health  (cluster port ${K8S_SERVICE_PORT})"
+      echo "Swarm:        http://localhost:8000/health"
     }
     failure {
       echo "Pipeline failed. Check the stage logs for details."
