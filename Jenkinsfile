@@ -21,9 +21,14 @@ pipeline {
     K8S_DEPLOY_REPLICAS  = '2'
     K8S_KUBECONFIG_CRED  = 'kubeconfig_file'
 
-    // Expose Kubernetes via NodePort
+    // Expose Kubernetes via NodePort (optional testing)
     K8S_SERVICE_PORT     = '8081'         // cluster service port
     K8S_NODE_PORT        = '31080'        // host port (30000–32767)
+
+    // How K8s should reference the image:
+    //  - 'local': use APP_NAME:latest (no registry) and IfNotPresent (no pull)
+    //  - 'registry': use host.docker.internal:5000/APP_NAME:latest
+    K8S_IMAGE_MODE       = 'local'
   }
 
   stages {
@@ -31,7 +36,6 @@ pipeline {
       steps {
         deleteDir()
         sh 'git --version'
-        // Shallow checkout without relying on job SCM config:
         sh 'git init && git remote add origin "${GIT_URL}" && git fetch --depth=1 origin "${GIT_BRANCH}" && git checkout -B "${GIT_BRANCH}" FETCH_HEAD'
       }
     }
@@ -39,13 +43,18 @@ pipeline {
     stage('Build & Push Image') {
       steps {
         sh 'docker version'
-        script { env.IMAGE = "${env.REGISTRY}/${env.APP_NAME}:${env.BUILD_NUMBER}" }
+        script {
+          env.IMAGE = "${env.REGISTRY}/${env.APP_NAME}:${env.BUILD_NUMBER}"
+        }
         sh """
           set -e
           docker build -t ${IMAGE} .
           docker push ${IMAGE}
           docker tag  ${IMAGE} ${LATEST}
           docker push ${LATEST}
+          # also tag a local image without registry for K8s local mode
+          docker tag ${LATEST} ${APP_NAME}:latest
+          docker image ls | grep ${APP_NAME} || true
         """
       }
     }
@@ -57,13 +66,12 @@ pipeline {
             set -e
             CID=\$(docker run -d -p 18000:8000 ${LATEST})
             echo "Temp container: \$CID"
-            # On Docker Desktop, reach the published port via host.docker.internal
-            for i in \$(seq 1 20); do
+            for i in \$(seq 1 30); do
               if curl -sf http://host.docker.internal:18000/health >/dev/null; then
                 echo "Smoke test passed"; break
               fi
-              sleep 1
-              if [ \$i -eq 20 ]; then
+              sleep 2
+              if [ \$i -eq 30 ]; then
                 echo "Smoke test FAILED"
                 docker logs "\$CID" || true
                 docker rm -f "\$CID" || true
@@ -71,11 +79,10 @@ pipeline {
             done
             docker rm -f "\$CID"
           """
-        }
-      }
+      } }
     }
 
-    stage('Prepare Stack File') {
+    stage('Prepare Swarm Stack File') {
       steps {
         writeFile file: 'docker-stack.yml', text: """
 version: '3.9'
@@ -115,6 +122,12 @@ networks:
     stage('Prepare K8s Manifests') {
       when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
       steps {
+        script {
+          // choose image reference for K8s
+          env.K8S_IMAGE = (env.K8S_IMAGE_MODE?.toLowerCase() == 'registry')
+            ? "host.docker.internal:5000/${env.APP_NAME}:latest"
+            : "${env.APP_NAME}:latest" // local mode (no pull)
+        }
         writeFile file: 'k8s-deploy.yaml', text: """
 apiVersion: apps/v1
 kind: Deployment
@@ -125,6 +138,7 @@ metadata:
     app: ${K8S_APP_NAME}
 spec:
   replicas: ${K8S_DEPLOY_REPLICAS}
+  revisionHistoryLimit: 2
   selector:
     matchLabels:
       app: ${K8S_APP_NAME}
@@ -135,21 +149,29 @@ spec:
     spec:
       containers:
       - name: api
-        image: ${LATEST}
-        imagePullPolicy: IfNotPresent
+        image: ${K8S_IMAGE}
+        imagePullPolicy: ${K8S_IMAGE_MODE == 'local' ? 'IfNotPresent' : 'Always'}
         env:
         - name: DJANGO_SECRET_KEY
           value: "prod-secret"
         ports:
         - containerPort: 8000
         readinessProbe:
-          httpGet: { path: /health, port: 8000 }
-          initialDelaySeconds: 5
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
           periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 12
         livenessProbe:
-          httpGet: { path: /health, port: 8000 }
-          initialDelaySeconds: 10
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 6
 ---
 apiVersion: v1
 kind: Service
@@ -179,8 +201,32 @@ spec:
             kubectl --kubeconfig "$KUBECONFIG_FILE" get ns ${K8S_NAMESPACE} >/dev/null 2>&1 || \
               kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace ${K8S_NAMESPACE}
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} apply -f k8s-deploy.yaml
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=120s
+            # give kubelet some time to create pods before waiting
+            sleep 5
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=300s
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -o wide -l app=${K8S_APP_NAME}
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc/${K8S_APP_NAME}
+          """
+        }
+      }
+    }
+
+    stage('K8s Debug (on failure)') {
+      when { allOf {
+        expression { env.USE_K8S?.toLowerCase() == 'true' }
+        anyOf { failed(); unstable() }
+      } }
+      steps {
+        withCredentials([file(credentialsId: "${K8S_KUBECONFIG_CRED}", variable: 'KUBECONFIG_FILE')]) {
+          sh """
+            set +e
+            echo "=== Describe deployment and pods ==="
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME}
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | xargs -I{} sh -c 'echo \"--- {} ---\"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {}'
+            echo "=== Pod logs (first container) ==="
+            for p in \$(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "\$p" --tail=200 || true
+            done
           """
         }
       }
@@ -194,7 +240,7 @@ spec:
       echo "K8s:   http://localhost:${K8S_NODE_PORT}/health (NodePort ${K8S_NODE_PORT}, service port ${K8S_SERVICE_PORT})"
     }
     failure {
-      echo "Pipeline failed. Check the stage logs for details."
+      echo "Pipeline failed. Check the K8s Debug output (describe/logs) above."
     }
   }
 }
