@@ -104,14 +104,14 @@ networks:
 
     stage('Deploy to Swarm') {
       steps {
-        sh """
+        sh '''
           set -e
           if ! docker network ls --format '{{.Name}}' | grep -q '^webnet$'; then
             docker network create -d overlay webnet
           fi
           docker stack deploy -c docker-stack.yml ${STACK}
           docker stack services ${STACK}
-        """
+        '''
       }
     }
 
