@@ -208,7 +208,7 @@ spec:
 
     stage('Deploy to Kubernetes') {
       when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
-      agent { docker { image 'bitnami/kubectl:1.30' } }
+      agent { docker { image 'bitnami/kubectl:latest' } }
       steps {
         withCredentials([file(credentialsId: "${K8S_KUBECONFIG_CRED}", variable: 'KUBECONFIG_FILE')]) {
           sh """
