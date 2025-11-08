@@ -10,7 +10,7 @@ pipeline {
     REPLICAS   = '2'
     LATEST     = "${REGISTRY}/${APP_NAME}:latest"
 
-    // Public repo (no creds). If private, add Jenkins creds and use withCredentials.
+    // Public repo (no creds). If private, add Jenkins creds and switch logic below.
     GIT_URL    = 'https://github.com/raizen707/django-rest-swarm'
     GIT_BRANCH = 'master'   // change to 'main' if your repo uses main
   }
@@ -19,7 +19,7 @@ pipeline {
     stage('Checkout (clean)') {
       agent {
         docker {
-          image 'docker:27'                               // Docker CLI present
+          image 'docker:27'                                // Alpine + Docker CLI
           args  '-v /var/run/docker.sock:/var/run/docker.sock'
           reuseNode true
         }
@@ -31,15 +31,15 @@ pipeline {
         // Public repo shallow fetch
         sh 'git init && git remote add origin "${GIT_URL}" && git fetch --depth=1 origin "${GIT_BRANCH}" && git checkout -B "${GIT_BRANCH}" FETCH_HEAD'
 
-        // If PRIVATE repo, replace the 3 lines above with this block:
-        // withCredentials([string(credentialsId: 'github_token', variable: 'GITHUB_TOKEN')]) {
-        //   sh '''
+        // If PRIVATE repo, replace the three lines above with:
+        // withCredentials([string(credentialsId: "github_token", variable: "GITHUB_TOKEN")]) {
+        //   sh """
         //     git init
         //     git config http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64 -w0)"
-        //     git remote add origin "${GIT_URL}"
-        //     git fetch --depth=1 origin "${GIT_BRANCH}"
-        //     git checkout -B "${GIT_BRANCH}" FETCH_HEAD
-        //   '''
+        //     git remote add origin ${GIT_URL}
+        //     git fetch --depth=1 origin ${GIT_BRANCH}
+        //     git checkout -B ${GIT_BRANCH} FETCH_HEAD
+        //   """
         // }
       }
     }
@@ -58,10 +58,11 @@ pipeline {
       steps {
         sh 'docker version'
         sh """
-          docker build -t "${IMAGE}" .
-          docker push "${IMAGE}"
-          docker tag  "${IMAGE}" "${LATEST}"
-          docker push "${LATEST}"
+          set -e
+          docker build -t ${IMAGE} .
+          docker push ${IMAGE}
+          docker tag  ${IMAGE} ${LATEST}
+          docker push ${LATEST}
         """
       }
     }
@@ -76,24 +77,24 @@ pipeline {
       }
       steps {
         sh 'apk add --no-cache curl'
-        sh '''
+        sh """
           set -e
-          CID=$(docker run -d -p 18000:8000 '"${LATEST}"')
-          echo "Temp container: $CID"
-          for i in $(seq 1 20); do
+          CID=\$(docker run -d -p 18000:8000 ${LATEST})
+          echo "Temp container: \$CID"
+          for i in \$(seq 1 20); do
             if curl -sf http://host.docker.internal:18000/health >/dev/null; then
               echo "Smoke test passed"; break
             fi
             sleep 1
-            if [ $i -eq 20 ]; then
+            if [ \$i -eq 20 ]; then
               echo "Smoke test FAILED"
-              docker logs "$CID" || true
-              docker rm -f "$CID" || true
+              docker logs "\$CID" || true
+              docker rm -f "\$CID" || true
               exit 1
             fi
           done
-          docker rm -f "$CID"
-        '''
+          docker rm -f "\$CID"
+        """
       }
     }
 
@@ -136,14 +137,14 @@ networks:
         }
       }
       steps {
-        sh '''
+        sh """
           set -e
           if ! docker network ls --format '{{.Name}}' | grep -q '^webnet$'; then
             docker network create -d overlay webnet
           fi
-          docker stack deploy -c docker-stack.yml '"${STACK}"'
-          docker stack services '"${STACK}"'
-        '''
+          docker stack deploy -c docker-stack.yml ${STACK}
+          docker stack services ${STACK}
+        """
       }
     }
   }
