@@ -5,3 +5,4 @@ urlpatterns = [
     path("health/", HealthView.as_view()),
     path("hello/", HelloView.as_view()),
 ]
+
