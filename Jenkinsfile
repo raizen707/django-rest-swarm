@@ -6,6 +6,7 @@ pipeline {
     ansiColor('xterm')
   }
 
+
   environment {
     // Adjust if you use a different registry or image name
     REGISTRY = 'localhost:5000'
