@@ -9,7 +9,6 @@ pipeline {
     LATEST = "${REGISTRY}/${APP_NAME}:latest"
     STACK = 'djstack'
   }
-
   stages {
     stage('Checkout') {
       steps { checkout scm }
