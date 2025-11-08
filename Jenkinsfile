@@ -25,9 +25,7 @@ pipeline {
     K8S_SERVICE_PORT     = '8081'         // cluster service port
     K8S_NODE_PORT        = '31080'        // host port (30000–32767)
 
-    // How K8s should reference the image:
-    //  - 'local': use APP_NAME:latest (no registry) and IfNotPresent (no pull)
-    //  - 'registry': use host.docker.internal:5000/APP_NAME:latest
+    // K8s image reference mode: 'local' (no pull) or 'registry'
     K8S_IMAGE_MODE       = 'local'
   }
 
@@ -43,16 +41,14 @@ pipeline {
     stage('Build & Push Image') {
       steps {
         sh 'docker version'
-        script {
-          env.IMAGE = "${env.REGISTRY}/${env.APP_NAME}:${env.BUILD_NUMBER}"
-        }
+        script { env.IMAGE = "${env.REGISTRY}/${env.APP_NAME}:${env.BUILD_NUMBER}" }
         sh """
           set -e
           docker build -t ${IMAGE} .
           docker push ${IMAGE}
           docker tag  ${IMAGE} ${LATEST}
           docker push ${LATEST}
-          # also tag a local image without registry for K8s local mode
+          # local tag for K8s 'local' mode
           docker tag ${LATEST} ${APP_NAME}:latest
           docker image ls | grep ${APP_NAME} || true
         """
@@ -79,7 +75,8 @@ pipeline {
             done
             docker rm -f "\$CID"
           """
-      } }
+        }
+      }
     }
 
     stage('Prepare Swarm Stack File') {
@@ -107,14 +104,14 @@ networks:
 
     stage('Deploy to Swarm') {
       steps {
-        sh '''
+        sh """
           set -e
           if ! docker network ls --format '{{.Name}}' | grep -q '^webnet$'; then
             docker network create -d overlay webnet
           fi
           docker stack deploy -c docker-stack.yml ${STACK}
           docker stack services ${STACK}
-        '''
+        """
       }
     }
 
@@ -123,7 +120,6 @@ networks:
       when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
       steps {
         script {
-          // choose image reference for K8s
           env.K8S_IMAGE = (env.K8S_IMAGE_MODE?.toLowerCase() == 'registry')
             ? "host.docker.internal:5000/${env.APP_NAME}:latest"
             : "${env.APP_NAME}:latest" // local mode (no pull)
@@ -201,32 +197,10 @@ spec:
             kubectl --kubeconfig "$KUBECONFIG_FILE" get ns ${K8S_NAMESPACE} >/dev/null 2>&1 || \
               kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace ${K8S_NAMESPACE}
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} apply -f k8s-deploy.yaml
-            # give kubelet some time to create pods before waiting
             sleep 5
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=300s
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -o wide -l app=${K8S_APP_NAME}
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc/${K8S_APP_NAME}
-          """
-        }
-      }
-    }
-
-    stage('K8s Debug (on failure)') {
-      when { allOf {
-        expression { env.USE_K8S?.toLowerCase() == 'true' }
-        anyOf { failed(); unstable() }
-      } }
-      steps {
-        withCredentials([file(credentialsId: "${K8S_KUBECONFIG_CRED}", variable: 'KUBECONFIG_FILE')]) {
-          sh """
-            set +e
-            echo "=== Describe deployment and pods ==="
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME}
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | xargs -I{} sh -c 'echo \"--- {} ---\"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {}'
-            echo "=== Pod logs (first container) ==="
-            for p in \$(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
-              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "\$p" --tail=200 || true
-            done
           """
         }
       }
@@ -239,8 +213,41 @@ spec:
       echo "Swarm: http://localhost:8000/health"
       echo "K8s:   http://localhost:${K8S_NODE_PORT}/health (NodePort ${K8S_NODE_PORT}, service port ${K8S_SERVICE_PORT})"
     }
+    unstable {
+      script {
+        if (env.USE_K8S?.toLowerCase() == 'true') {
+          withCredentials([file(credentialsId: env.K8S_KUBECONFIG_CRED, variable: 'KUBECONFIG_FILE')]) {
+            sh """
+              set +e
+              echo "=== K8s DEBUG (unstable) ==="
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME}
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | \
+                xargs -I{} sh -c 'echo "--- {} ---"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {}'
+              for p in \$(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
+                kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "\$p" --tail=200 || true
+              done
+            """
+          }
+        }
+      }
+    }
     failure {
-      echo "Pipeline failed. Check the K8s Debug output (describe/logs) above."
+      script {
+        if (env.USE_K8S?.toLowerCase() == 'true') {
+          withCredentials([file(credentialsId: env.K8S_KUBECONFIG_CRED, variable: 'KUBECONFIG_FILE')]) {
+            sh """
+              set +e
+              echo "=== K8s DEBUG (failure) ==="
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe deploy/${K8S_APP_NAME}
+              kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name | \
+                xargs -I{} sh -c 'echo "--- {} ---"; kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} describe {}'
+              for p in \$(kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get pods -l app=${K8S_APP_NAME} -o name); do
+                kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} logs "\$p" --tail=200 || true
+              done
+            """
+          }
+        }
+      }
     }
   }
 }
