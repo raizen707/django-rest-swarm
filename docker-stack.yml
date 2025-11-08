@@ -1,0 +1,21 @@
+version: "3.9"
+services:
+  api:
+    image: localhost:5000/django-rest-swarm:0.1.0
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-prod-secret}
+    networks:
+      - webnet
+    deploy:
+      replicas: 2
+      restart_policy: { condition: on-failure }
+      update_config:
+        parallelism: 1
+        order: start-first
+        delay: 5s
+
+networks:
+  webnet:
+    external: true
