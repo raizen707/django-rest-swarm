@@ -1,44 +1,62 @@
 pipeline {
   agent any
-
-  options {
-    timestamps()
-    ansiColor('xterm')
-  }
-
+  options { timestamps() }
 
   environment {
-    // Adjust if you use a different registry or image name
-    REGISTRY = 'localhost:5000'
-    APP_NAME = 'django-rest-swarm'
-    STACK    = 'djstack'
-    REPLICAS = '2'
-    LATEST   = "${REGISTRY}/${APP_NAME}:latest"
+    // ---- Adjust to your setup ----
+    REGISTRY   = 'localhost:5000'
+    APP_NAME   = 'django-rest-swarm'
+    STACK      = 'djstack'
+    REPLICAS   = '2'
+    LATEST     = "${REGISTRY}/${APP_NAME}:latest"
+
+    // Public repo (no creds). If private, add Jenkins creds and use withCredentials.
+    GIT_URL    = 'https://github.com/raizen707/django-rest-swarm'
+    GIT_BRANCH = 'master'   // change to 'main' if your repo uses main
   }
 
   stages {
-    stage('Checkout') {
+    stage('Checkout (clean)') {
+      agent {
+        docker {
+          image 'docker:27'                               // Docker CLI present
+          args  '-v /var/run/docker.sock:/var/run/docker.sock'
+          reuseNode true
+        }
+      }
       steps {
-        checkout scm
+        sh 'apk add --no-cache git'
+        deleteDir()
         sh 'git --version'
+        // Public repo shallow fetch
+        sh 'git init && git remote add origin "${GIT_URL}" && git fetch --depth=1 origin "${GIT_BRANCH}" && git checkout -B "${GIT_BRANCH}" FETCH_HEAD'
+
+        // If PRIVATE repo, replace the 3 lines above with this block:
+        // withCredentials([string(credentialsId: 'github_token', variable: 'GITHUB_TOKEN')]) {
+        //   sh '''
+        //     git init
+        //     git config http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64 -w0)"
+        //     git remote add origin "${GIT_URL}"
+        //     git fetch --depth=1 origin "${GIT_BRANCH}"
+        //     git checkout -B "${GIT_BRANCH}" FETCH_HEAD
+        //   '''
+        // }
       }
     }
 
     stage('Build & Push Image') {
       agent {
         docker {
-          image 'docker:27-git'                      // Docker CLI + Git (Alpine)
+          image 'docker:27'
           args  '-v /var/run/docker.sock:/var/run/docker.sock'
           reuseNode true
         }
       }
       environment {
-        COMMIT = "${env.BUILD_NUMBER}"              // or use `git rev-parse --short HEAD`
-        IMAGE  = "${REGISTRY}/${APP_NAME}:${BUILD_NUMBER}"
+        IMAGE = "${REGISTRY}/${APP_NAME}:${BUILD_NUMBER}"
       }
       steps {
         sh 'docker version'
-        // Build & push
         sh """
           docker build -t "${IMAGE}" .
           docker push "${IMAGE}"
@@ -51,25 +69,20 @@ pipeline {
     stage('Smoke Test') {
       agent {
         docker {
-          image 'docker:27-git'
+          image 'docker:27'
           args  '-v /var/run/docker.sock:/var/run/docker.sock'
           reuseNode true
         }
       }
       steps {
-        // Alpine container used as the agent; install curl to perform the test
         sh 'apk add --no-cache curl'
-
-        // Run a temporary container on host port 18000, probe /health via host.docker.internal (Windows/Mac Desktop)
         sh '''
           set -e
           CID=$(docker run -d -p 18000:8000 '"${LATEST}"')
           echo "Temp container: $CID"
-          # small wait for gunicorn to boot
           for i in $(seq 1 20); do
             if curl -sf http://host.docker.internal:18000/health >/dev/null; then
-              echo "Smoke test passed"
-              break
+              echo "Smoke test passed"; break
             fi
             sleep 1
             if [ $i -eq 20 ]; then
@@ -87,13 +100,12 @@ pipeline {
     stage('Prepare Stack File') {
       agent {
         docker {
-          image 'docker:27-cli'
+          image 'docker:27'
           args  '-v /var/run/docker.sock:/var/run/docker.sock'
           reuseNode true
         }
       }
       steps {
-        // Write (or overwrite) stack file pointing to :latest image
         writeFile file: 'docker-stack.yml', text: """
 version: '3.9'
 services:
@@ -118,13 +130,12 @@ networks:
     stage('Deploy to Swarm') {
       agent {
         docker {
-          image 'docker:27-cli'
+          image 'docker:27'
           args  '-v /var/run/docker.sock:/var/run/docker.sock'
           reuseNode true
         }
       }
       steps {
-        // Ensure overlay network exists, then deploy
         sh '''
           set -e
           if ! docker network ls --format '{{.Name}}' | grep -q '^webnet$'; then
@@ -140,15 +151,10 @@ networks:
   post {
     success {
       echo "Deployed ${LATEST} to stack ${STACK} with ${REPLICAS} replicas."
-      echo "Test endpoints: http://localhost:8000/health  http://localhost:8000/hello"
+      echo "Test: http://localhost:8000/health  http://localhost:8000/hello"
     }
     failure {
-      echo "Pipeline failed. Check stage logs above."
-    }
-    always {
-      script {
-        currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.BRANCH_NAME ?: ''}".trim()
-      }
+      echo "Pipeline failed. Check the stage logs for details."
     }
   }
 }
