@@ -76,25 +76,27 @@ pipeline {
         }
       }
       steps {
-        sh 'apk add --no-cache curl'
-        sh """
-          set -e
-          CID=\$(docker run -d -p 18000:8000 ${LATEST})
-          echo "Temp container: \$CID"
-          for i in \$(seq 1 20); do
-            if curl -sf http://host.docker.internal:18000/health >/dev/null; then
-              echo "Smoke test passed"; break
-            fi
-            sleep 1
-            if [ \$i -eq 20 ]; then
-              echo "Smoke test FAILED"
-              docker logs "\$CID" || true
-              docker rm -f "\$CID" || true
-              exit 1
-            fi
-          done
-          docker rm -f "\$CID"
-        """
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+          sh 'apk add --no-cache curl'
+          sh """
+            set -e
+            CID=\$(docker run -d -p 18000:8000 ${LATEST})
+            echo "Temp container: \$CID"
+            for i in \$(seq 1 20); do
+              if curl -sf http://host.docker.internal:18000/health >/dev/null; then
+                echo "Smoke test passed"; break
+              fi
+              sleep 1
+              if [ \$i -eq 20 ]; then
+                echo "Smoke test FAILED"
+                docker logs "\$CID" || true
+                docker rm -f "\$CID" || true
+                exit 1
+              fi
+            done
+            docker rm -f "\$CID"
+          """
+        }
       }
     }
 
