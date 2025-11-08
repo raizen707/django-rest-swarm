@@ -138,14 +138,14 @@ networks:
         }
       }
       steps {
-        sh """
+        sh '''
           set -e
           if ! docker network ls --format '{{.Name}}' | grep -q '^webnet$'; then
             docker network create -d overlay webnet
           fi
-          docker stack deploy -c docker-stack.yml ${STACK}   // <-- no quotes here
+          docker stack deploy -c docker-stack.yml ${STACK}
           docker stack services ${STACK}
-        """
+        '''
       }
     }
   }
