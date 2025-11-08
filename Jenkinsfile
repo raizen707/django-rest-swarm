@@ -3,72 +3,43 @@ pipeline {
   options { timestamps() }
 
   environment {
-    // ---- Adjust to your setup ----
-    REGISTRY   = 'localhost:5000'
-    APP_NAME   = 'django-rest-swarm'
-    STACK      = 'djstack'
-    REPLICAS   = '2'
-    LATEST     = "${REGISTRY}/${APP_NAME}:latest"
+    // ---- Docker/Swarm ----
+    REGISTRY  = 'localhost:5000'
+    APP_NAME  = 'django-rest-swarm'
+    STACK     = 'djstack'
+    REPLICAS  = '2'
+    LATEST    = "${REGISTRY}/${APP_NAME}:latest"
 
-    // Public repo (no creds). If private, add Jenkins creds and switch logic below.
+    // ---- Git ----
     GIT_URL    = 'https://github.com/raizen707/django-rest-swarm'
-    GIT_BRANCH = 'master'   // change to 'main' if your repo uses main
+    GIT_BRANCH = 'master'   // change to 'main' if needed
 
-    // ---- Kubernetes (optional) ----
-    USE_K8S              = 'true'        // set to 'true' to enable K8s stages
+    // ---- Kubernetes (toggle ON to deploy) ----
+    USE_K8S              = 'true'         // set 'true' to enable K8s stages
     K8S_NAMESPACE        = 'default'
     K8S_APP_NAME         = 'django-rest-api'
     K8S_DEPLOY_REPLICAS  = '2'
-    // Jenkins "Secret file" credential containing your kubeconfig:
     K8S_KUBECONFIG_CRED  = 'kubeconfig_file'
 
-    // Expose Kubernetes on another host port via NodePort
-    K8S_SERVICE_PORT     = '8081'   // cluster Service port
-    K8S_NODE_PORT        = '31080'  // external host port (30000–32767)
+    // Expose Kubernetes via NodePort
+    K8S_SERVICE_PORT     = '8081'         // cluster service port
+    K8S_NODE_PORT        = '31080'        // host port (30000–32767)
   }
 
   stages {
     stage('Checkout (clean)') {
-      agent {
-        docker {
-          image 'docker:27'                                // Alpine + Docker CLI
-          args  '-v /var/run/docker.sock:/var/run/docker.sock'
-          reuseNode true
-        }
-      }
       steps {
-        sh 'apk add --no-cache git'
         deleteDir()
         sh 'git --version'
-        // Public repo shallow fetch
+        // Shallow checkout without relying on job SCM config:
         sh 'git init && git remote add origin "${GIT_URL}" && git fetch --depth=1 origin "${GIT_BRANCH}" && git checkout -B "${GIT_BRANCH}" FETCH_HEAD'
-
-        // If PRIVATE repo, replace the three lines above with:
-        // withCredentials([string(credentialsId: "github_token", variable: "GITHUB_TOKEN")]) {
-        //   sh """
-        //     git init
-        //     git config http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64 -w0)"
-        //     git remote add origin ${GIT_URL}
-        //     git fetch --depth=1 origin ${GIT_BRANCH}
-        //     git checkout -B ${GIT_BRANCH} FETCH_HEAD
-        //   """
-        // }
       }
     }
 
     stage('Build & Push Image') {
-      agent {
-        docker {
-          image 'docker:27'
-          args  '-v /var/run/docker.sock:/var/run/docker.sock'
-          reuseNode true
-        }
-      }
-      environment {
-        IMAGE = "${REGISTRY}/${APP_NAME}:${BUILD_NUMBER}"
-      }
       steps {
         sh 'docker version'
+        script { env.IMAGE = "${env.REGISTRY}/${env.APP_NAME}:${env.BUILD_NUMBER}" }
         sh """
           set -e
           docker build -t ${IMAGE} .
@@ -80,20 +51,13 @@ pipeline {
     }
 
     stage('Smoke Test') {
-      agent {
-        docker {
-          image 'docker:27'
-          args  '-v /var/run/docker.sock:/var/run/docker.sock'
-          reuseNode true
-        }
-      }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-          sh 'apk add --no-cache curl'
           sh """
             set -e
             CID=\$(docker run -d -p 18000:8000 ${LATEST})
             echo "Temp container: \$CID"
+            # On Docker Desktop, reach the published port via host.docker.internal
             for i in \$(seq 1 20); do
               if curl -sf http://host.docker.internal:18000/health >/dev/null; then
                 echo "Smoke test passed"; break
@@ -112,13 +76,6 @@ pipeline {
     }
 
     stage('Prepare Stack File') {
-      agent {
-        docker {
-          image 'docker:27'
-          args  '-v /var/run/docker.sock:/var/run/docker.sock'
-          reuseNode true
-        }
-      }
       steps {
         writeFile file: 'docker-stack.yml', text: """
 version: '3.9'
@@ -142,13 +99,6 @@ networks:
     }
 
     stage('Deploy to Swarm') {
-      agent {
-        docker {
-          image 'docker:27'
-          args  '-v /var/run/docker.sock:/var/run/docker.sock'
-          reuseNode true
-        }
-      }
       steps {
         sh '''
           set -e
@@ -212,25 +162,25 @@ spec:
   type: NodePort
   ports:
   - name: http
-    port: ${K8S_SERVICE_PORT}   # cluster service port (e.g., 8081)
-    targetPort: 8000            # container port
-    nodePort: ${K8S_NODE_PORT}  # host port (e.g., 31080)
+    port: ${K8S_SERVICE_PORT}
+    targetPort: 8000
+    nodePort: ${K8S_NODE_PORT}
 """
       }
     }
 
     stage('Deploy to Kubernetes') {
       when { expression { env.USE_K8S?.toLowerCase() == 'true' } }
-      agent { docker { image 'bitnami/kubectl:latest' } }
       steps {
         withCredentials([file(credentialsId: "${K8S_KUBECONFIG_CRED}", variable: 'KUBECONFIG_FILE')]) {
           sh """
             set -e
+            kubectl --kubeconfig "$KUBECONFIG_FILE" version --client
             kubectl --kubeconfig "$KUBECONFIG_FILE" get ns ${K8S_NAMESPACE} >/dev/null 2>&1 || \
               kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace ${K8S_NAMESPACE}
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} apply -f k8s-deploy.yaml
             kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} rollout status deploy/${K8S_APP_NAME} --timeout=120s
-            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc,deploy,pods -l app=${K8S_APP_NAME}
+            kubectl --kubeconfig "$KUBECONFIG_FILE" -n ${K8S_NAMESPACE} get svc/${K8S_APP_NAME}
           """
         }
       }
@@ -240,9 +190,8 @@ spec:
 
   post {
     success {
-      echo "Swarm: deployed ${LATEST} to stack ${STACK} with ${REPLICAS} replicas."
-      echo "K8s NodePort: http://localhost:${K8S_NODE_PORT}/health  (cluster port ${K8S_SERVICE_PORT})"
-      echo "Swarm:        http://localhost:8000/health"
+      echo "Swarm: http://localhost:8000/health"
+      echo "K8s:   http://localhost:${K8S_NODE_PORT}/health (NodePort ${K8S_NODE_PORT}, service port ${K8S_SERVICE_PORT})"
     }
     failure {
       echo "Pipeline failed. Check the stage logs for details."
