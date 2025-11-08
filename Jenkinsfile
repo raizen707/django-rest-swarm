@@ -7,7 +7,7 @@ pipeline {
     REGISTRY   = 'localhost:5000'
     APP_NAME   = 'django-rest-swarm'
     STACK      = 'djstack'
-    REPLICAS   = '2'
+    REPLICAS   = '5'
     LATEST     = "${REGISTRY}/${APP_NAME}:latest"
 
     // Public repo (no creds). If private, add Jenkins creds and switch logic below.
