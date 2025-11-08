@@ -7,7 +7,7 @@ pipeline {
     REGISTRY   = 'localhost:5000'
     APP_NAME   = 'django-rest-swarm'
     STACK      = 'djstack'
-    REPLICAS   = '5'
+    REPLICAS   = '2'
     LATEST     = "${REGISTRY}/${APP_NAME}:latest"
 
     // Public repo (no creds). If private, add Jenkins creds and switch logic below.
@@ -146,6 +146,61 @@ networks:
           docker stack deploy -c docker-stack.yml ${STACK}
           docker stack services ${STACK}
         '''
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      agent {
+        docker {
+          image 'bitnami/kubectl:latest'
+          args  '-v ${HOME}/.kube:/root/.kube'
+          reuseNode true
+        }
+      }
+      steps {
+        sh """
+          cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  labels:
+    app: ${APP_NAME}
+spec:
+  replicas: ${REPLICAS}
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+    spec:
+      containers:
+      - name: ${APP_NAME}
+        image: ${LATEST}
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DJANGO_SECRET_KEY
+          value: "prod-secret"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}
+spec:
+  type: NodePort
+  selector:
+    app: ${APP_NAME}
+  ports:
+  - port: 8000
+    targetPort: 8000
+    nodePort: 30800
+EOF
+          kubectl rollout status deployment/${APP_NAME}
+          kubectl get pods -l app=${APP_NAME}
+        """
       }
     }
   }
